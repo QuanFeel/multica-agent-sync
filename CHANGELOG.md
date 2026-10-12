@@ -3,6 +3,17 @@
 All notable changes are documented here. This project follows Semantic
 Versioning.
 
+## 1.3.0 - unreleased
+
+### Added
+
+- Report `active_ms` on heartbeats and run completion: the watcher now folds
+  each rollout event's timestamp into a span ledger (`<5 min` gaps bridge as
+  tool time, longer gaps stay idle) so the server's run duration reflects
+  agent work instead of wall clock. Idle time never accumulates, and a
+  watcher restart resumes from the persisted span marker without billing the
+  offline gap. Replacement runs (heartbeat rotations) start a fresh ledger.
+
 ## 1.2.1 - 2026-08-31
 
 ### Fixed

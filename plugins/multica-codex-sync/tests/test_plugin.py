@@ -1267,3 +1267,49 @@ class PluginLifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ActiveSpanTests(unittest.TestCase):
+    """active_ms is the union of model-activity spans, not wall clock."""
+
+    def test_events_bridge_within_gap_and_split_across_it(self) -> None:
+        state: dict = {}
+        base = 1_000.0
+        core.note_active_event(state, base)
+        core.note_active_event(state, base + 10)
+        core.note_active_event(state, base + 15)  # 5s tool gap bridges
+        core.note_active_event(state, base + 25)
+        self.assertEqual(state["active_ms"], 25_000)
+
+        resume = base + 25 + core.LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS + 1
+        core.note_active_event(state, resume)
+        core.note_active_event(state, resume + 21)
+        # The 5-minute idle gap is not billed; only the trailing span counts.
+        self.assertEqual(state["active_ms"], 25_000 + 21_000)
+
+    def test_out_of_order_and_invalid_events_are_ignored(self) -> None:
+        state: dict = {}
+        core.note_active_event(state, 1_000.0)
+        core.note_active_event(state, 900.0)  # older than the last marker: no negative time
+        core.note_active_event(state, float("nan"))
+        core.note_active_event(state, 0)
+        core.note_active_event(state, None)
+        self.assertEqual(state["active_ms"], 0)
+        self.assertEqual(state["active_span_last"], 900.0)
+
+    def test_reset_starts_a_fresh_ledger(self) -> None:
+        state: dict = {}
+        core.note_active_event(state, 1_000.0)
+        core.note_active_event(state, 2_000.0)
+        core.reset_active_span(state)
+        self.assertEqual(state["active_ms"], 0)
+        self.assertEqual(state["active_span_last"], 0.0)
+
+    def test_entry_epoch_handles_z_and_garbage(self) -> None:
+        self.assertAlmostEqual(
+            codex_adapter.entry_epoch_seconds({"timestamp": "2026-10-12T03:42:12.910Z"}),
+            1_791_776_532.91,
+            places=2,
+        )
+        self.assertEqual(codex_adapter.entry_epoch_seconds({}), 0.0)
+        self.assertEqual(codex_adapter.entry_epoch_seconds({"timestamp": "not-a-date"}), 0.0)
