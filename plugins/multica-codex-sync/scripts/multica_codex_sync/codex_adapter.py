@@ -58,6 +58,79 @@ def find_session(session_id: str | None = None):
     raise RuntimeError("No matching Codex Desktop session was found")
 
 
+FORK_FOLLOW_POLL_SECONDS = 5.0
+MAX_TRACKED_SOURCE_KEYS = 2000
+
+
+def find_forked_session_file(session_id: str, current_path: Path) -> Path | None:
+    """Return the newest Codex Desktop rollout file that continues this session.
+
+    Codex Desktop resume/compact keeps the session id but writes a new rollout
+    file and never appends to the previously tracked one again; a watcher that
+    only tails its original path would idle out forever on the frozen file.
+    """
+    if not session_id:
+        return None
+    root = CODEX_HOME / "sessions"
+    try:
+        current_mtime = current_path.stat().st_mtime
+    except OSError:
+        return None
+    best: tuple[float, Path] | None = None
+    try:
+        candidates = list(root.glob("**/rollout-*.jsonl"))
+    except OSError:
+        return None
+    for candidate in candidates:
+        if candidate == current_path:
+            continue
+        try:
+            mtime = candidate.stat().st_mtime
+        except OSError:
+            continue
+        # Resume forks are always written after the tracked file froze; the
+        # mtime floor keeps the watcher from switching back to an older file
+        # (e.g. the original rollout) and ping-ponging between them.
+        if mtime <= current_mtime:
+            continue
+        if best is None or mtime > best[0]:
+            best = (mtime, candidate)
+    if best is None:
+        return None
+    meta = desktop_session_meta(best[1])
+    if not meta or meta.get("id") != session_id:
+        return None
+    return best[1]
+
+
+def maybe_follow_session_fork(state: dict, current_path: Path, state_path: Path) -> bool:
+    """Switch tracking to a forked rollout file; returns True when switched.
+
+    The switch restarts reading from offset 0: the fork replays the full
+    history, message uploads dedupe via the persisted uploaded_source_keys,
+    and token usage replay is neutralized by the monotonic totals check.
+    """
+    now = time.time()
+    last_check = float(state.get("last_fork_check_at") or 0)
+    if now - last_check < FORK_FOLLOW_POLL_SECONDS:
+        return False
+    state["last_fork_check_at"] = now
+    fork_path = find_forked_session_file(str(state.get("session_id") or ""), current_path)
+    if fork_path is None:
+        return False
+    state["session_file"] = str(fork_path)
+    state["offset"] = 0
+    state["fork_follow_count"] = int_field(state.get("fork_follow_count")) + 1
+    state["fork_followed_at"] = now
+    state["updated_at"] = now
+    atomic_json(state_path, state)
+    append_private_log(
+        state_log_path(state),
+        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} following session fork -> {fork_path.name}\n",
+    )
+    return True
+
+
 def latest_model(path: Path) -> str:
     model = "codex"
     try:
@@ -345,17 +418,27 @@ def post_message(api: Api, state: dict, entry: dict) -> None:
     if role == "user" and is_control_command_text(text):
         return
     timestamp = str(entry.get("timestamp") or "")
+    dedupe_key = source_key(state["session_id"], timestamp, role, text)
+    if dedupe_key in state.setdefault("uploaded_source_keys", []):
+        # Forked rollout files replay history; the server dedupes per run, so
+        # the watcher must skip keys it already uploaded across run rotations.
+        return
     body = {
         "type": "user_input" if role == "user" else "final",
         "content": text,
         "source": "multica-codex-sync",
-        "source_key": source_key(state["session_id"], timestamp, role, text),
+        "source_key": dedupe_key,
     }
-    with_upload_run(
-        api,
-        state,
-        lambda run_id: api.request("POST", f"/api/local-runs/{run_id}/messages", body),
-    )
+
+    def upload(run_id: str) -> None:
+        api.request("POST", f"/api/local-runs/{run_id}/messages", body)
+        keys = state.setdefault("uploaded_source_keys", [])
+        if dedupe_key not in keys:
+            keys.append(dedupe_key)
+            if len(keys) > MAX_TRACKED_SOURCE_KEYS:
+                del keys[: len(keys) - MAX_TRACKED_SOURCE_KEYS]
+
+    with_upload_run(api, state, upload)
 
 
 def post_usage(api: Api, state: dict, entry: dict) -> None:
@@ -448,77 +531,80 @@ def watcher(state_path: Path) -> int:
     state = read_json(state_path)
     if not isinstance(state, dict) or state.get("status") != "running":
         return 0
-    path = Path(state["session_file"])
-    position = int(state.get("offset") or 0)
-    ensure_usage_baseline(state, path, position)
-    atomic_json(state_path, state)
-    with path.open("r", encoding="utf-8") as handle:
-        handle.seek(position)
-        while True:
-            current = read_json(state_path, {})
-            if current.get("status") != "running":
-                break
-            if not plugin_installation_available(current):
-                try:
-                    complete_local_run(api, str(state.get("run_id") or ""))
-                    state["last_server_run_status"] = "completed"
-                except Exception as error:  # noqa: BLE001 - watcher cleanup must not crash
-                    state["server_stop_error"] = str(error)
-                state["status"] = "stopped"
-                state["stopped_at"] = time.time()
-                state["stop_reason"] = "plugin-root-missing"
-                atomic_json(state_path, state)
-                break
-            line_start = handle.tell()
-            line = handle.readline()
-            if not line:
-                try:
-                    if maybe_pause_idle_run(api, state) or refresh_local_run(api, state):
-                        state["updated_at"] = time.time()
-                        atomic_json(state_path, state)
-                except Exception as error:  # noqa: BLE001 - watcher heartbeat must recover
-                    append_private_log(
-                        state_log_path(state),
-                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} heartbeat {error}\n",
-                    )
-                time.sleep(0.25)
-                continue
-            position = handle.tell()
-            try:
-                entry = json.loads(line)
-                state["last_event_at"] = time.time()
-                update_model(state, entry)
-                if state.get("suppress_until_next_user"):
-                    if is_business_user_message(entry):
-                        state["suppress_until_next_user"] = False
-                    else:
-                        current = read_json(state_path, {})
-                        if current.get("status") != "running":
-                            break
-                        if current.get("pid"):
-                            state["pid"] = current["pid"]
-                        state["offset"] = position
-                        state["updated_at"] = time.time()
-                        atomic_json(state_path, state)
-                        continue
-                if refresh_local_run(api, state):
-                    state["updated_at"] = time.time()
-                    atomic_json(state_path, state)
-                post_message(api, state, entry)
-                post_usage(api, state, entry)
+    while True:
+        path = Path(state["session_file"])
+        position = int(state.get("offset") or 0)
+        ensure_usage_baseline(state, path, position)
+        atomic_json(state_path, state)
+        with path.open("r", encoding="utf-8") as handle:
+            handle.seek(position)
+            while True:
                 current = read_json(state_path, {})
                 if current.get("status") != "running":
-                    break
-                if current.get("pid"):
-                    state["pid"] = current["pid"]
-                state["offset"] = position
-                state["updated_at"] = time.time()
-                atomic_json(state_path, state)
-            except Exception as error:  # noqa: BLE001 - keep watcher failures inspectable
-                handle.seek(line_start)
-                append_private_log(
-                    state_log_path(state),
-                    f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {error}\n",
-                )
-                time.sleep(1)
+                    return 0
+                if not plugin_installation_available(current):
+                    try:
+                        complete_local_run(api, str(state.get("run_id") or ""))
+                        state["last_server_run_status"] = "completed"
+                    except Exception as error:  # noqa: BLE001 - watcher cleanup must not crash
+                        state["server_stop_error"] = str(error)
+                    state["status"] = "stopped"
+                    state["stopped_at"] = time.time()
+                    state["stop_reason"] = "plugin-root-missing"
+                    atomic_json(state_path, state)
+                    return 0
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    if maybe_follow_session_fork(state, path, state_path):
+                        break  # reopen the forked rollout file from offset 0
+                    try:
+                        if maybe_pause_idle_run(api, state) or refresh_local_run(api, state):
+                            state["updated_at"] = time.time()
+                            atomic_json(state_path, state)
+                    except Exception as error:  # noqa: BLE001 - watcher heartbeat must recover
+                        append_private_log(
+                            state_log_path(state),
+                            f"{time.strftime('%Y-%m-%dT%H:%M:%S')} heartbeat {error}\n",
+                        )
+                    time.sleep(0.25)
+                    continue
+                position = handle.tell()
+                try:
+                    entry = json.loads(line)
+                    state["last_event_at"] = time.time()
+                    update_model(state, entry)
+                    if state.get("suppress_until_next_user"):
+                        if is_business_user_message(entry):
+                            state["suppress_until_next_user"] = False
+                        else:
+                            current = read_json(state_path, {})
+                            if current.get("status") != "running":
+                                return 0
+                            if current.get("pid"):
+                                state["pid"] = current["pid"]
+                            state["offset"] = position
+                            state["updated_at"] = time.time()
+                            atomic_json(state_path, state)
+                            continue
+                    if refresh_local_run(api, state):
+                        state["updated_at"] = time.time()
+                        atomic_json(state_path, state)
+                    post_message(api, state, entry)
+                    post_usage(api, state, entry)
+                    current = read_json(state_path, {})
+                    if current.get("status") != "running":
+                        return 0
+                    if current.get("pid"):
+                        state["pid"] = current["pid"]
+                    state["offset"] = position
+                    state["updated_at"] = time.time()
+                    atomic_json(state_path, state)
+                except Exception as error:  # noqa: BLE001 - keep watcher failures inspectable
+                    handle.seek(line_start)
+                    append_private_log(
+                        state_log_path(state),
+                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {error}\n",
+                    )
+                    time.sleep(1)
     return 0

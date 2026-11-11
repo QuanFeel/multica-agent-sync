@@ -3,6 +3,16 @@
 All notable changes are documented here. This project follows Semantic
 Versioning.
 
+## Unreleased
+
+### Fixed
+
+- Follow Codex Desktop resume/compact session forks (a new rollout file that
+  keeps the session id) instead of idling on the frozen rollout until the
+  local run is marked completed by the idle timeout; replayed history is
+  deduplicated locally before upload, so the issue thread receives no
+  duplicates across run rotations.
+
 ## 1.2.1 - 2026-08-31
 
 ### Fixed
