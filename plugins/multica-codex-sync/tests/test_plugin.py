@@ -20,8 +20,8 @@ HOOK = SCRIPTS / "prompt_submit.py"
 CLI_ENTRYPOINT = SCRIPTS / "multica_codex_track.py"
 sys.path.insert(0, str(SCRIPTS))
 
-import prompt_submit
-from multica_codex_sync import cli, codex_adapter, core
+import prompt_submit  # noqa: E402
+from multica_codex_sync import cli, codex_adapter, core  # noqa: E402
 
 
 @contextmanager
@@ -1277,10 +1277,12 @@ class ForkFollowTests(unittest.TestCase):
         *,
         mtime: float | None = None,
         originator: str = "Codex Desktop",
+        entries: tuple[dict, ...] = (),
+        header_timestamp: str = "2026-11-10T08:00:00.000Z",
     ) -> Path:
         path.parent.mkdir(parents=True, exist_ok=True)
         entry = {
-            "timestamp": "2026-11-10T08:00:00.000Z",
+            "timestamp": header_timestamp,
             "type": "session_meta",
             "payload": {
                 "id": session_id,
@@ -1288,7 +1290,10 @@ class ForkFollowTests(unittest.TestCase):
                 "originator": originator,
             },
         }
-        path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        path.write_text(
+            "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in (entry, *entries)),
+            encoding="utf-8",
+        )
         if mtime is not None:
             os.utime(path, (mtime, mtime))
         return path
@@ -1346,74 +1351,180 @@ class ForkFollowTests(unittest.TestCase):
                 mtime=2000.0,
                 originator="codex-cli",
             )
+            fork = self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-matching.jsonl",
+                self.SESSION_ID,
+                mtime=1500.0,
+            )
             with mock.patch.object(codex_adapter, "CODEX_HOME", codex_home):
                 found = codex_adapter.find_forked_session_file(self.SESSION_ID, parent)
-            self.assertIsNone(found)
+            self.assertEqual(found, fork)
+
+    def test_find_forked_session_file_ignores_symlinked_rollouts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory)
+            parent = self._write_rollout(
+                codex_home / "sessions/rollout-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+            )
+            outside = self._write_rollout(
+                codex_home / "outside/rollout-matching.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+            )
+            (codex_home / "sessions/rollout-link.jsonl").symlink_to(outside)
+            (codex_home / "sessions/linked").symlink_to(outside.parent, target_is_directory=True)
+            with mock.patch.object(codex_adapter, "CODEX_HOME", codex_home):
+                self.assertIsNone(codex_adapter.find_forked_session_file(self.SESSION_ID, parent))
 
     def test_maybe_follow_session_fork_switches_files_and_throttles(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             codex_home = root / "codex-home"
+            previous = self._message("2026-11-10T08:20:00.000Z", "already consumed")
             parent = self._write_rollout(
                 codex_home / "sessions/2026/11/09/rollout-2026-11-09T18-00-00-parent.jsonl",
                 self.SESSION_ID,
                 mtime=1000.0,
+                entries=(previous,),
             )
-            self._write_rollout(
+            fork = self._write_rollout(
                 codex_home / "sessions/2026/11/10/rollout-2026-11-10T08-00-00-parent-child.jsonl",
                 self.SESSION_ID,
                 mtime=2000.0,
+                entries=(previous,),
+                header_timestamp="2026-11-10T09:00:00.000Z",
             )
             state_path = root / "state.json"
             state = {
                 "status": "running",
                 "session_id": self.SESSION_ID,
                 "session_file": str(parent),
-                "offset": 123,
+                "offset": parent.stat().st_size,
                 "run_id": "run-1",
             }
+            codex_adapter.atomic_json(state_path, state)
             with (
                 mock.patch.object(codex_adapter, "CODEX_HOME", codex_home),
                 mock.patch.object(core, "LOGS_DIR", root / "logs"),
             ):
                 self.assertTrue(codex_adapter.maybe_follow_session_fork(state, parent, state_path))
                 self.assertFalse(codex_adapter.maybe_follow_session_fork(state, parent, state_path))
-            self.assertTrue(state["session_file"].endswith("parent-child.jsonl"))
-            self.assertEqual(state["offset"], 0)
+            self.assertEqual(state["session_file"], str(fork))
+            self.assertEqual(state["offset"], fork.stat().st_size)
             self.assertEqual(state["fork_follow_count"], 1)
             saved = json.loads(state_path.read_text())
-            self.assertTrue(saved["session_file"].endswith("parent-child.jsonl"))
+            self.assertEqual(saved["session_file"], str(fork))
+            self.assertEqual(saved["offset"], fork.stat().st_size)
 
-    def test_post_message_does_not_repost_history_replayed_by_a_fork(self) -> None:
-        state = {
-            "status": "running",
-            "session_id": self.SESSION_ID,
-            "issue_id": "11111111-1111-1111-1111-111111111111",
-            "run_id": "run-1",
-            "last_server_run_status": "running",
-        }
-        requests: list[tuple[str, str]] = []
-
-        class RecordingApi:
-            def request(self, method: str, path: str, body=None):
-                requests.append((method, path))
-                return {"status": "running"}
-
-        entry = {
+    @staticmethod
+    def _message(timestamp: str, content: str) -> dict:
+        return {
             "type": "response_item",
-            "timestamp": "2026-11-10T08:20:00.000Z",
+            "timestamp": timestamp,
             "payload": {
                 "type": "message",
                 "role": "assistant",
-                "content": [{"type": "output_text", "text": "replayed reply"}],
+                "content": [{"type": "output_text", "text": content}],
             },
         }
-        codex_adapter.post_message(RecordingApi(), state, entry)
-        codex_adapter.post_message(RecordingApi(), state, entry)
-        self.assertEqual(len(requests), 1)
-        self.assertEqual(requests[0][0], "POST")
-        self.assertIn("/messages", requests[0][1])
-        self.assertEqual(len(state["uploaded_source_keys"]), 1)
+
+    @staticmethod
+    def _usage(input_tokens: int, field: str = "total_token_usage") -> dict:
+        return {
+            "type": "event_msg",
+            "payload": {"type": "token_count", "info": {field: {"input_tokens": input_tokens}}},
+        }
+
+    def test_unverified_fork_does_not_move_the_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            previous = self._message("2026-11-10T08:20:00.000Z", "historical fixture")
+            parent = self._write_rollout(
+                root / "sessions/rollout-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+                entries=(previous,),
+            )
+            candidate = root / "sessions/rollout-fork.jsonl"
+            unrelated = self._message("2026-11-10T08:25:00.000Z", "unmatched fixture")
+            state_path = root / "state.json"
+            checkpoint = parent.stat().st_size
+            for entries in ((), (unrelated,)):
+                with self.subTest(entries=entries):
+                    self._write_rollout(candidate, self.SESSION_ID, mtime=2000.0, entries=entries)
+                    state = {
+                        "status": "running",
+                        "session_id": self.SESSION_ID,
+                        "session_file": str(parent),
+                        "offset": checkpoint,
+                    }
+                    codex_adapter.atomic_json(state_path, state)
+                    with mock.patch.object(codex_adapter, "CODEX_HOME", root):
+                        self.assertFalse(codex_adapter.maybe_follow_session_fork(state, parent, state_path))
+                    self.assertEqual(state["offset"], checkpoint)
+                    self.assertEqual(codex_adapter.read_json(state_path)["session_file"], str(parent))
+
+    def test_watcher_resumes_after_replay_without_reposting_messages_or_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before_bind = self._message("2026-11-10T08:10:00.000Z", "before binding ✓")
+            uploaded = self._message("2026-11-10T08:20:00.000Z", "already uploaded")
+            new_message = self._message("2026-11-10T09:00:00.000Z", "new continuation")
+            history = (before_bind, self._usage(80), uploaded, self._usage(20, "last_token_usage"), self._usage(100))
+            parent = self._write_rollout(
+                root / "sessions/rollout-parent.jsonl", self.SESSION_ID, mtime=1000.0, entries=history,
+            )
+            inherited_header = json.loads(parent.read_bytes().splitlines()[0])
+            fork = self._write_rollout(
+                root / "sessions/rollout-fork.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+                entries=(inherited_header, *history, new_message, self._usage(130)),
+                header_timestamp="2026-11-10T09:00:00.000Z",
+            )
+            state_path = root / "state.json"
+            codex_adapter.atomic_json(state_path, {
+                "status": "running",
+                "session_id": self.SESSION_ID,
+                "session_file": str(parent),
+                "offset": parent.stat().st_size,
+                "issue_id": "fixture-issue",
+                "run_id": "run-1",
+                "run_mode": "session",
+                "short_lived_runs": False,
+                "last_server_run_status": "completed",
+                "run_paused_at": 1,
+                "usage_totals": codex_adapter.normalized_usage_total({"input_tokens": 100}),
+            })
+            api = mock.Mock()
+            api.request.return_value = {"id": "run-2", "status": "running"}
+
+            def stop_when_idle(_seconds: float) -> None:
+                saved = codex_adapter.read_json(state_path)
+                self.assertEqual(saved["session_file"], str(fork))
+                self.assertEqual(saved["offset"], fork.stat().st_size)
+                saved["status"] = "stopped"
+                codex_adapter.atomic_json(state_path, saved)
+
+            with (
+                mock.patch.object(codex_adapter, "CODEX_HOME", root),
+                mock.patch.object(core, "LOGS_DIR", root / "logs"),
+                mock.patch.object(codex_adapter, "Api", return_value=api),
+                mock.patch.object(codex_adapter.time, "sleep", side_effect=stop_when_idle),
+            ):
+                self.assertEqual(codex_adapter.watcher(state_path), 0)
+
+            calls = api.request.call_args_list
+            messages = [call.args for call in calls if call.args[1].endswith("/messages")]
+            usage = [call.args for call in calls if call.args[1].endswith("/usage")]
+            self.assertEqual([(path, body["content"]) for _, path, body in messages], [
+                ("/api/local-runs/run-2/messages", "new continuation"),
+            ])
+            self.assertEqual([(path, body["usage"][0]["input_tokens"]) for _, path, body in usage], [
+                ("/api/local-runs/run-2/usage", 30),
+            ])
 
 
 if __name__ == "__main__":

@@ -33,12 +33,12 @@ def desktop_session_meta(path: Path):
                 if not line:
                     break
                 entry = json.loads(line)
-                if entry.get("type") == "session_meta":
-                    payload = entry.get("payload") or {}
-                    if payload.get("originator") == "Codex Desktop":
+                if isinstance(entry, dict) and entry.get("type") == "session_meta":
+                    payload = entry.get("payload")
+                    if isinstance(payload, dict) and payload.get("originator") == "Codex Desktop":
                         return payload
                     return None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return None
 
@@ -59,7 +59,6 @@ def find_session(session_id: str | None = None):
 
 
 FORK_FOLLOW_POLL_SECONDS = 5.0
-MAX_TRACKED_SOURCE_KEYS = 2000
 
 
 def find_forked_session_file(session_id: str, current_path: Path) -> Path | None:
@@ -72,44 +71,67 @@ def find_forked_session_file(session_id: str, current_path: Path) -> Path | None
     if not session_id:
         return None
     root = CODEX_HOME / "sessions"
+    if CODEX_HOME.is_symlink() or root.is_symlink() or current_path.is_symlink():
+        return None
     try:
-        current_mtime = current_path.stat().st_mtime
+        current_mtime = current_path.stat().st_mtime_ns
     except OSError:
         return None
-    best: tuple[float, Path] | None = None
+    candidates: list[tuple[int, Path]] = []
     try:
-        candidates = list(root.glob("**/rollout-*.jsonl"))
+        for candidate in root.glob("**/rollout-*.jsonl"):
+            if candidate == current_path or candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                mtime = candidate.stat().st_mtime_ns
+            except OSError:
+                continue
+            if mtime > current_mtime:
+                candidates.append((mtime, candidate))
     except OSError:
         return None
-    for candidate in candidates:
-        if candidate == current_path:
-            continue
-        try:
-            mtime = candidate.stat().st_mtime
-        except OSError:
-            continue
-        # Resume forks are always written after the tracked file froze; the
-        # mtime floor keeps the watcher from switching back to an older file
-        # (e.g. the original rollout) and ping-ponging between them.
-        if mtime <= current_mtime:
-            continue
-        if best is None or mtime > best[0]:
-            best = (mtime, candidate)
-    if best is None:
+    for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+        meta = desktop_session_meta(candidate)
+        if meta and meta.get("id") == session_id:
+            return candidate
+    return None
+
+
+def is_session_meta_line(line: bytes) -> bool:
+    if b'"session_meta"' not in line:
+        return False
+    entry = json.loads(line)
+    return isinstance(entry, dict) and entry.get("type") == "session_meta"
+
+
+def fork_offset_after_replay(current_path: Path, fork_path: Path, offset: int) -> int | None:
+    """Map the current checkpoint to a fork only when its replay matches."""
+    if offset <= 0:
         return None
-    meta = desktop_session_meta(best[1])
-    if not meta or meta.get("id") != session_id:
+    try:
+        with current_path.open("rb") as current, fork_path.open("rb") as fork:
+            while current.tell() < offset:
+                previous_line = current.readline()
+                if not previous_line.endswith(b"\n"):
+                    return None
+                if is_session_meta_line(previous_line):
+                    continue
+                replay_line = fork.readline()
+                while replay_line.endswith(b"\n") and is_session_meta_line(replay_line):
+                    replay_line = fork.readline()
+                if not replay_line.endswith(b"\n"):
+                    return None
+                if previous_line != replay_line and json.loads(previous_line) != json.loads(replay_line):
+                    return None
+            if current.tell() == offset and not current.peek(1):
+                return fork.tell()
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
-    return best[1]
+    return None
 
 
 def maybe_follow_session_fork(state: dict, current_path: Path, state_path: Path) -> bool:
-    """Switch tracking to a forked rollout file; returns True when switched.
-
-    The switch restarts reading from offset 0: the fork replays the full
-    history, message uploads dedupe via the persisted uploaded_source_keys,
-    and token usage replay is neutralized by the monotonic totals check.
-    """
+    """Switch to a verified continuation at the last consumed record."""
     now = time.time()
     last_check = float(state.get("last_fork_check_at") or 0)
     if now - last_check < FORK_FOLLOW_POLL_SECONDS:
@@ -118,16 +140,21 @@ def maybe_follow_session_fork(state: dict, current_path: Path, state_path: Path)
     fork_path = find_forked_session_file(str(state.get("session_id") or ""), current_path)
     if fork_path is None:
         return False
+    offset = fork_offset_after_replay(current_path, fork_path, int_field(state.get("offset")))
+    if offset is None:
+        return False
+    current = read_json(state_path, {})
+    if current.get("status") != "running":
+        return False
+    for key in ("pid", "process_identity"):
+        if key in current:
+            state[key] = current[key]
     state["session_file"] = str(fork_path)
-    state["offset"] = 0
+    state["offset"] = offset
     state["fork_follow_count"] = int_field(state.get("fork_follow_count")) + 1
     state["fork_followed_at"] = now
     state["updated_at"] = now
     atomic_json(state_path, state)
-    append_private_log(
-        state_log_path(state),
-        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} following session fork -> {fork_path.name}\n",
-    )
     return True
 
 
@@ -418,27 +445,17 @@ def post_message(api: Api, state: dict, entry: dict) -> None:
     if role == "user" and is_control_command_text(text):
         return
     timestamp = str(entry.get("timestamp") or "")
-    dedupe_key = source_key(state["session_id"], timestamp, role, text)
-    if dedupe_key in state.setdefault("uploaded_source_keys", []):
-        # Forked rollout files replay history; the server dedupes per run, so
-        # the watcher must skip keys it already uploaded across run rotations.
-        return
     body = {
         "type": "user_input" if role == "user" else "final",
         "content": text,
         "source": "multica-codex-sync",
-        "source_key": dedupe_key,
+        "source_key": source_key(state["session_id"], timestamp, role, text),
     }
-
-    def upload(run_id: str) -> None:
-        api.request("POST", f"/api/local-runs/{run_id}/messages", body)
-        keys = state.setdefault("uploaded_source_keys", [])
-        if dedupe_key not in keys:
-            keys.append(dedupe_key)
-            if len(keys) > MAX_TRACKED_SOURCE_KEYS:
-                del keys[: len(keys) - MAX_TRACKED_SOURCE_KEYS]
-
-    with_upload_run(api, state, upload)
+    with_upload_run(
+        api,
+        state,
+        lambda run_id: api.request("POST", f"/api/local-runs/{run_id}/messages", body),
+    )
 
 
 def post_usage(api: Api, state: dict, entry: dict) -> None:
@@ -531,11 +548,11 @@ def watcher(state_path: Path) -> int:
     state = read_json(state_path)
     if not isinstance(state, dict) or state.get("status") != "running":
         return 0
+    ensure_usage_baseline(state, Path(state["session_file"]), int(state.get("offset") or 0))
+    atomic_json(state_path, state)
     while True:
         path = Path(state["session_file"])
         position = int(state.get("offset") or 0)
-        ensure_usage_baseline(state, path, position)
-        atomic_json(state_path, state)
         with path.open("r", encoding="utf-8") as handle:
             handle.seek(position)
             while True:
@@ -557,7 +574,7 @@ def watcher(state_path: Path) -> int:
                 line = handle.readline()
                 if not line:
                     if maybe_follow_session_fork(state, path, state_path):
-                        break  # reopen the forked rollout file from offset 0
+                        break
                     try:
                         if maybe_pause_idle_run(api, state) or refresh_local_run(api, state):
                             state["updated_at"] = time.time()
@@ -607,4 +624,3 @@ def watcher(state_path: Path) -> int:
                         f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {error}\n",
                     )
                     time.sleep(1)
-    return 0

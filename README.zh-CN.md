@@ -10,6 +10,8 @@
 Multica Agent Sync 是一个开源 Codex 插件：它把一个 Codex Desktop 任务绑定
 到一个 Multica issue，并持续把绑定后的可见对话和 token 用量同步到对应的
 local run。
+如果 Codex Desktop 恢复任务时生成了新的 rollout 文件，watcher 会先校验其中
+复制的历史记录，再从已保存的位置继续同步。
 
 当前仓库**只实现 Codex**。运行时已经把 Codex 适配层与 Multica 传输层分开，
 便于未来评估其他 Agent，但这个版本不包含、也不宣称支持 Claude。

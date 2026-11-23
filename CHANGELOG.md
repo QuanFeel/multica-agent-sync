@@ -7,11 +7,9 @@ Versioning.
 
 ### Fixed
 
-- Follow Codex Desktop resume/compact session forks (a new rollout file that
-  keeps the session id) instead of idling on the frozen rollout until the
-  local run is marked completed by the idle timeout; replayed history is
-  deduplicated locally before upload, so the issue thread receives no
-  duplicates across run rotations.
+- Follow newer Codex Desktop rollouts for the bound session when the replay
+  matches the saved checkpoint. Continue from that checkpoint so only new
+  messages and token usage are synchronized, including after run rotation.
 
 ## 1.2.1 - 2026-08-31
 
