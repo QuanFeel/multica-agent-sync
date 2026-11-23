@@ -5,6 +5,12 @@ Versioning.
 
 ## Unreleased
 
+### Added
+
+- Multica receives an estimated active duration from Codex Desktop rollout
+  timestamps. Consecutive events less than five minutes apart contribute to
+  the duration of their local run.
+
 ### Fixed
 
 - Follow newer Codex Desktop rollouts for the bound session when the replay

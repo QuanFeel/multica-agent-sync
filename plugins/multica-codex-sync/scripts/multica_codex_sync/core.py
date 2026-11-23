@@ -3,6 +3,7 @@ from __future__ import annotations
 import fcntl
 import hashlib
 import json
+import math
 import os
 import shlex
 import subprocess
@@ -42,8 +43,42 @@ USAGE_TOTAL_KEYS = {
 }
 LOCAL_RUN_HEARTBEAT_INTERVAL_SECONDS = 30
 LOCAL_RUN_IDLE_TIMEOUT_SECONDS = int(os.environ.get("MULTICA_CODEX_IDLE_TIMEOUT_SECONDS", "1800"))
+# Model-activity events closer than this are one stretch of agent work (tool
+# runs between two model events); longer gaps are idle or human time.
+LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS = 300
 PLUGIN_DATA_MARKER = TRACK_HOME / ".multica-codex-sync-owned"
 PLUGIN_DATA_MARKER_CONTENT = "multica-codex-sync-plugin-data-v2\n"
+
+def note_active_event(state: dict, event_epoch: float) -> None:
+    """Fold one model-activity event into the run's active_ms.
+
+    Events closer than LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS bridge into one
+    stretch of agent work; longer gaps are idle or human time. The server's
+    dashboard prefers active_ms over wall clock for run duration, so keeping
+    this honest is what makes duration meaningful for long-lived sessions:
+    idle time never accumulates, and a watcher restart simply resumes from
+    the persisted ``active_span_last`` marker.
+    """
+    try:
+        moment = float(event_epoch)
+    except (TypeError, ValueError):
+        return
+    if not math.isfinite(moment) or moment <= 0:
+        # NaN would poison every later comparison and silently freeze the
+        # ledger, so non-finite stamps are dropped the same way as garbage.
+        return
+    state.setdefault("active_ms", 0)
+    last = float(state.get("active_span_last") or 0)
+    if 0 < last and 0 < moment - last < LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS:
+        state["active_ms"] = int(state.get("active_ms") or 0) + int((moment - last) * 1000)
+    state["active_span_last"] = moment
+
+
+def reset_active_span(state: dict) -> None:
+    """Start a fresh active-time ledger for a replacement run."""
+    state["active_ms"] = 0
+    state["active_span_last"] = 0.0
+
 
 def secure_mkdir(path: Path) -> None:
     if path.is_symlink():
@@ -533,12 +568,12 @@ def create_local_run(api: Api, issue_id: str, meta: dict) -> str:
     return run_id
 
 
-def complete_local_run(api: Api, run_id: str) -> None:
-    api.request(
-        "PATCH",
-        f"/api/local-runs/{run_id}",
-        {"status": "completed", "exit_code": 0, "error": ""},
-    )
+def complete_local_run(api: Api, run_id: str, active_ms: int = 0) -> None:
+    body = {"status": "completed", "exit_code": 0, "error": ""}
+    active = int(active_ms or 0)
+    if active > 0:
+        body["active_ms"] = active
+    api.request("PATCH", f"/api/local-runs/{run_id}", body)
 
 
 def upload_run_meta(state: dict) -> dict:
