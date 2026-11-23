@@ -1265,5 +1265,156 @@ class PluginLifecycleTests(unittest.TestCase):
             self.assertNotIn("server_stop_error", saved)
 
 
+class ForkFollowTests(unittest.TestCase):
+    """Regression coverage for Codex Desktop resume/compact fork following."""
+
+    SESSION_ID = "01aaaaaa-0000-0000-0000-000000000001"
+
+    def _write_rollout(
+        self,
+        path: Path,
+        session_id: str,
+        *,
+        mtime: float | None = None,
+        originator: str = "Codex Desktop",
+    ) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        entry = {
+            "timestamp": "2026-11-10T08:00:00.000Z",
+            "type": "session_meta",
+            "payload": {
+                "id": session_id,
+                "session_id": session_id,
+                "originator": originator,
+            },
+        }
+        path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+        if mtime is not None:
+            os.utime(path, (mtime, mtime))
+        return path
+
+    def test_find_forked_session_file_returns_the_newer_same_session_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory)
+            parent = self._write_rollout(
+                codex_home / "sessions/2026/11/09/rollout-2026-11-09T18-00-00-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+            )
+            fork = self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-2026-11-10T08-00-00-parent-child.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+            )
+            with mock.patch.object(codex_adapter, "CODEX_HOME", codex_home):
+                found = codex_adapter.find_forked_session_file(self.SESSION_ID, parent)
+            self.assertEqual(found, fork)
+
+    def test_find_forked_session_file_never_moves_back_to_an_older_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory)
+            self._write_rollout(
+                codex_home / "sessions/2026/11/09/rollout-2026-11-09T18-00-00-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+            )
+            fork = self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-2026-11-10T08-00-00-parent-child.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+            )
+            with mock.patch.object(codex_adapter, "CODEX_HOME", codex_home):
+                found = codex_adapter.find_forked_session_file(self.SESSION_ID, fork)
+            self.assertIsNone(found)
+
+    def test_find_forked_session_file_ignores_other_sessions_and_non_desktop_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            codex_home = Path(directory)
+            parent = self._write_rollout(
+                codex_home / "sessions/2026/11/09/rollout-2026-11-09T18-00-00-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+            )
+            self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-2026-11-10T08-00-00-other.jsonl",
+                "01aaaaaa-0000-0000-0000-000000000002",
+                mtime=3000.0,
+            )
+            self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-2026-11-10T09-00-00-cli.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+                originator="codex-cli",
+            )
+            with mock.patch.object(codex_adapter, "CODEX_HOME", codex_home):
+                found = codex_adapter.find_forked_session_file(self.SESSION_ID, parent)
+            self.assertIsNone(found)
+
+    def test_maybe_follow_session_fork_switches_files_and_throttles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            codex_home = root / "codex-home"
+            parent = self._write_rollout(
+                codex_home / "sessions/2026/11/09/rollout-2026-11-09T18-00-00-parent.jsonl",
+                self.SESSION_ID,
+                mtime=1000.0,
+            )
+            self._write_rollout(
+                codex_home / "sessions/2026/11/10/rollout-2026-11-10T08-00-00-parent-child.jsonl",
+                self.SESSION_ID,
+                mtime=2000.0,
+            )
+            state_path = root / "state.json"
+            state = {
+                "status": "running",
+                "session_id": self.SESSION_ID,
+                "session_file": str(parent),
+                "offset": 123,
+                "run_id": "run-1",
+            }
+            with (
+                mock.patch.object(codex_adapter, "CODEX_HOME", codex_home),
+                mock.patch.object(core, "LOGS_DIR", root / "logs"),
+            ):
+                self.assertTrue(codex_adapter.maybe_follow_session_fork(state, parent, state_path))
+                self.assertFalse(codex_adapter.maybe_follow_session_fork(state, parent, state_path))
+            self.assertTrue(state["session_file"].endswith("parent-child.jsonl"))
+            self.assertEqual(state["offset"], 0)
+            self.assertEqual(state["fork_follow_count"], 1)
+            saved = json.loads(state_path.read_text())
+            self.assertTrue(saved["session_file"].endswith("parent-child.jsonl"))
+
+    def test_post_message_does_not_repost_history_replayed_by_a_fork(self) -> None:
+        state = {
+            "status": "running",
+            "session_id": self.SESSION_ID,
+            "issue_id": "11111111-1111-1111-1111-111111111111",
+            "run_id": "run-1",
+            "last_server_run_status": "running",
+        }
+        requests: list[tuple[str, str]] = []
+
+        class RecordingApi:
+            def request(self, method: str, path: str, body=None):
+                requests.append((method, path))
+                return {"status": "running"}
+
+        entry = {
+            "type": "response_item",
+            "timestamp": "2026-11-10T08:20:00.000Z",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "replayed reply"}],
+            },
+        }
+        codex_adapter.post_message(RecordingApi(), state, entry)
+        codex_adapter.post_message(RecordingApi(), state, entry)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][0], "POST")
+        self.assertIn("/messages", requests[0][1])
+        self.assertEqual(len(state["uploaded_source_keys"]), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
