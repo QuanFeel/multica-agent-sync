@@ -10,6 +10,8 @@ English | [简体中文](README.zh-CN.md)
 Multica Agent Sync is an open-source Codex plugin that binds one Codex Desktop
 task to one Multica issue. After binding, it continuously sends new visible
 conversation messages and token usage to the issue's local run.
+If Codex Desktop resumes that task in a new rollout file, the watcher
+continues from the saved position after verifying the copied history.
 
 The repository currently ships **Codex support only**. Its runtime separates the
 Codex adapter from the Multica transport so other agent hosts can be considered

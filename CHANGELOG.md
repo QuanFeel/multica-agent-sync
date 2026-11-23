@@ -3,6 +3,14 @@
 All notable changes are documented here. This project follows Semantic
 Versioning.
 
+## Unreleased
+
+### Fixed
+
+- Follow newer Codex Desktop rollouts for the bound session when the replay
+  matches the saved checkpoint. Continue from that checkpoint so only new
+  messages and token usage are synchronized, including after run rotation.
+
 ## 1.2.1 - 2026-08-31
 
 ### Fixed

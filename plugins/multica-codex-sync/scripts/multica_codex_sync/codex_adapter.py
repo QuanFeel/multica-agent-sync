@@ -33,12 +33,12 @@ def desktop_session_meta(path: Path):
                 if not line:
                     break
                 entry = json.loads(line)
-                if entry.get("type") == "session_meta":
-                    payload = entry.get("payload") or {}
-                    if payload.get("originator") == "Codex Desktop":
+                if isinstance(entry, dict) and entry.get("type") == "session_meta":
+                    payload = entry.get("payload")
+                    if isinstance(payload, dict) and payload.get("originator") == "Codex Desktop":
                         return payload
                     return None
-    except (OSError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError):
         return None
     return None
 
@@ -56,6 +56,106 @@ def find_session(session_id: str | None = None):
             continue
         return path, meta
     raise RuntimeError("No matching Codex Desktop session was found")
+
+
+FORK_FOLLOW_POLL_SECONDS = 5.0
+
+
+def find_forked_session_file(session_id: str, current_path: Path) -> Path | None:
+    """Return the newest Codex Desktop rollout file that continues this session.
+
+    Codex Desktop resume/compact keeps the session id but writes a new rollout
+    file and never appends to the previously tracked one again; a watcher that
+    only tails its original path would idle out forever on the frozen file.
+    """
+    if not session_id:
+        return None
+    root = CODEX_HOME / "sessions"
+    if CODEX_HOME.is_symlink() or root.is_symlink() or current_path.is_symlink():
+        return None
+    try:
+        current_mtime = current_path.stat().st_mtime_ns
+    except OSError:
+        return None
+    candidates: list[tuple[int, Path]] = []
+    try:
+        for candidate in root.glob("**/rollout-*.jsonl"):
+            if candidate == current_path or candidate.is_symlink() or not candidate.is_file():
+                continue
+            try:
+                mtime = candidate.stat().st_mtime_ns
+            except OSError:
+                continue
+            if mtime > current_mtime:
+                candidates.append((mtime, candidate))
+    except OSError:
+        return None
+    for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+        meta = desktop_session_meta(candidate)
+        if meta and meta.get("id") == session_id:
+            return candidate
+    return None
+
+
+def is_session_meta_line(line: bytes) -> bool:
+    if b'"session_meta"' not in line:
+        return False
+    entry = json.loads(line)
+    return isinstance(entry, dict) and entry.get("type") == "session_meta"
+
+
+def fork_offset_after_replay(current_path: Path, fork_path: Path, offset: int) -> int | None:
+    """Map the current checkpoint to a fork only when its replay matches."""
+    if offset <= 0:
+        return None
+    try:
+        with current_path.open("rb") as current, fork_path.open("rb") as fork:
+            while current.tell() < offset:
+                previous_line = current.readline()
+                if not previous_line.endswith(b"\n"):
+                    return None
+                if is_session_meta_line(previous_line):
+                    continue
+                replay_line = fork.readline()
+                while replay_line.endswith(b"\n") and is_session_meta_line(replay_line):
+                    replay_line = fork.readline()
+                if not replay_line.endswith(b"\n"):
+                    return None
+                if previous_line != replay_line and json.loads(previous_line) != json.loads(replay_line):
+                    return None
+            if current.tell() == offset and not current.peek(1):
+                return fork.tell()
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return None
+
+
+def maybe_follow_session_fork(state: dict, current_path: Path, state_path: Path) -> bool:
+    """Switch to a verified continuation at the last consumed record."""
+    now = time.time()
+    last_check = float(state.get("last_fork_check_at") or 0)
+    if now - last_check < FORK_FOLLOW_POLL_SECONDS:
+        return False
+    state["last_fork_check_at"] = now
+    fork_path = find_forked_session_file(str(state.get("session_id") or ""), current_path)
+    if fork_path is None:
+        return False
+    offset = fork_offset_after_replay(current_path, fork_path, int_field(state.get("offset")))
+    if offset is None:
+        return False
+    current = read_json(state_path, {})
+    if current.get("status") != "running":
+        return False
+    for key in ("pid", "process_identity"):
+        if key in current:
+            state[key] = current[key]
+    state["session_file"] = str(fork_path)
+    state["offset"] = offset
+    state["fork_follow_count"] = int_field(state.get("fork_follow_count")) + 1
+    state["fork_followed_at"] = now
+    state["updated_at"] = now
+    atomic_json(state_path, state)
+    return True
 
 
 def latest_model(path: Path) -> str:
@@ -448,77 +548,79 @@ def watcher(state_path: Path) -> int:
     state = read_json(state_path)
     if not isinstance(state, dict) or state.get("status") != "running":
         return 0
-    path = Path(state["session_file"])
-    position = int(state.get("offset") or 0)
-    ensure_usage_baseline(state, path, position)
+    ensure_usage_baseline(state, Path(state["session_file"]), int(state.get("offset") or 0))
     atomic_json(state_path, state)
-    with path.open("r", encoding="utf-8") as handle:
-        handle.seek(position)
-        while True:
-            current = read_json(state_path, {})
-            if current.get("status") != "running":
-                break
-            if not plugin_installation_available(current):
-                try:
-                    complete_local_run(api, str(state.get("run_id") or ""))
-                    state["last_server_run_status"] = "completed"
-                except Exception as error:  # noqa: BLE001 - watcher cleanup must not crash
-                    state["server_stop_error"] = str(error)
-                state["status"] = "stopped"
-                state["stopped_at"] = time.time()
-                state["stop_reason"] = "plugin-root-missing"
-                atomic_json(state_path, state)
-                break
-            line_start = handle.tell()
-            line = handle.readline()
-            if not line:
-                try:
-                    if maybe_pause_idle_run(api, state) or refresh_local_run(api, state):
-                        state["updated_at"] = time.time()
-                        atomic_json(state_path, state)
-                except Exception as error:  # noqa: BLE001 - watcher heartbeat must recover
-                    append_private_log(
-                        state_log_path(state),
-                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} heartbeat {error}\n",
-                    )
-                time.sleep(0.25)
-                continue
-            position = handle.tell()
-            try:
-                entry = json.loads(line)
-                state["last_event_at"] = time.time()
-                update_model(state, entry)
-                if state.get("suppress_until_next_user"):
-                    if is_business_user_message(entry):
-                        state["suppress_until_next_user"] = False
-                    else:
-                        current = read_json(state_path, {})
-                        if current.get("status") != "running":
-                            break
-                        if current.get("pid"):
-                            state["pid"] = current["pid"]
-                        state["offset"] = position
-                        state["updated_at"] = time.time()
-                        atomic_json(state_path, state)
-                        continue
-                if refresh_local_run(api, state):
-                    state["updated_at"] = time.time()
-                    atomic_json(state_path, state)
-                post_message(api, state, entry)
-                post_usage(api, state, entry)
+    while True:
+        path = Path(state["session_file"])
+        position = int(state.get("offset") or 0)
+        with path.open("r", encoding="utf-8") as handle:
+            handle.seek(position)
+            while True:
                 current = read_json(state_path, {})
                 if current.get("status") != "running":
-                    break
-                if current.get("pid"):
-                    state["pid"] = current["pid"]
-                state["offset"] = position
-                state["updated_at"] = time.time()
-                atomic_json(state_path, state)
-            except Exception as error:  # noqa: BLE001 - keep watcher failures inspectable
-                handle.seek(line_start)
-                append_private_log(
-                    state_log_path(state),
-                    f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {error}\n",
-                )
-                time.sleep(1)
-    return 0
+                    return 0
+                if not plugin_installation_available(current):
+                    try:
+                        complete_local_run(api, str(state.get("run_id") or ""))
+                        state["last_server_run_status"] = "completed"
+                    except Exception as error:  # noqa: BLE001 - watcher cleanup must not crash
+                        state["server_stop_error"] = str(error)
+                    state["status"] = "stopped"
+                    state["stopped_at"] = time.time()
+                    state["stop_reason"] = "plugin-root-missing"
+                    atomic_json(state_path, state)
+                    return 0
+                line_start = handle.tell()
+                line = handle.readline()
+                if not line:
+                    if maybe_follow_session_fork(state, path, state_path):
+                        break
+                    try:
+                        if maybe_pause_idle_run(api, state) or refresh_local_run(api, state):
+                            state["updated_at"] = time.time()
+                            atomic_json(state_path, state)
+                    except Exception as error:  # noqa: BLE001 - watcher heartbeat must recover
+                        append_private_log(
+                            state_log_path(state),
+                            f"{time.strftime('%Y-%m-%dT%H:%M:%S')} heartbeat {error}\n",
+                        )
+                    time.sleep(0.25)
+                    continue
+                position = handle.tell()
+                try:
+                    entry = json.loads(line)
+                    state["last_event_at"] = time.time()
+                    update_model(state, entry)
+                    if state.get("suppress_until_next_user"):
+                        if is_business_user_message(entry):
+                            state["suppress_until_next_user"] = False
+                        else:
+                            current = read_json(state_path, {})
+                            if current.get("status") != "running":
+                                return 0
+                            if current.get("pid"):
+                                state["pid"] = current["pid"]
+                            state["offset"] = position
+                            state["updated_at"] = time.time()
+                            atomic_json(state_path, state)
+                            continue
+                    if refresh_local_run(api, state):
+                        state["updated_at"] = time.time()
+                        atomic_json(state_path, state)
+                    post_message(api, state, entry)
+                    post_usage(api, state, entry)
+                    current = read_json(state_path, {})
+                    if current.get("status") != "running":
+                        return 0
+                    if current.get("pid"):
+                        state["pid"] = current["pid"]
+                    state["offset"] = position
+                    state["updated_at"] = time.time()
+                    atomic_json(state_path, state)
+                except Exception as error:  # noqa: BLE001 - keep watcher failures inspectable
+                    handle.seek(line_start)
+                    append_private_log(
+                        state_log_path(state),
+                        f"{time.strftime('%Y-%m-%dT%H:%M:%S')} {error}\n",
+                    )
+                    time.sleep(1)
