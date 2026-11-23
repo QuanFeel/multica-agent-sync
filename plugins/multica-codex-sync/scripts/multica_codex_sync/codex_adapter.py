@@ -4,6 +4,7 @@ import hashlib
 import json
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from .core import (
@@ -18,8 +19,9 @@ from .core import (
     complete_local_run,
     create_local_run,
     int_field,
+    note_active_event,
     read_json,
-    reset_current_run_usage,
+    reset_local_run_counters,
     state_log_path,
     with_upload_run,
 )
@@ -267,6 +269,20 @@ def is_business_user_message(entry: dict) -> bool:
     return bool(text and not is_control_command_text(text))
 
 
+def entry_epoch_seconds(entry: dict) -> float:
+    """Read a timezone-aware rollout timestamp for active duration."""
+    raw = entry.get("timestamp")
+    if not isinstance(raw, str):
+        return 0.0
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    try:
+        stamp = datetime.fromisoformat(raw)
+        return stamp.timestamp() if stamp.tzinfo is not None else 0.0
+    except (ValueError, OverflowError, OSError):
+        return 0.0
+
+
 def source_key(session_id: str, timestamp: str, kind: str, text: str) -> str:
     digest = hashlib.sha256(f"{session_id}\0{timestamp}\0{kind}\0{text}".encode()).hexdigest()[:24]
     return f"codex-desktop:{session_id}:{kind}:{digest}"
@@ -367,7 +383,7 @@ def reconnect_local_run(api: Api, state: dict, reason: str) -> bool:
     }
     state["run_id"] = create_local_run(api, state["issue_id"], meta)
     state["last_upload_run_id"] = state["run_id"]
-    reset_current_run_usage(state, state["run_id"])
+    reset_local_run_counters(state, state["run_id"])
     state["server_run_rotations"] = int_field(state.get("server_run_rotations")) + 1
     state["server_run_count"] = int_field(state.get("server_run_count")) + 1
     state["last_server_run_status"] = "running"
@@ -402,7 +418,10 @@ def refresh_local_run(api: Api, state: dict, force: bool = False) -> bool:
     if not force and now - last_attempt < LOCAL_RUN_HEARTBEAT_INTERVAL_SECONDS:
         return False
     state["last_heartbeat_attempt_at"] = now
-    response = api.request("PATCH", f"/api/local-runs/{state['run_id']}", {"status": "running"})
+    body = {"status": "running"}
+    if "active_ms" in state:
+        body["active_ms"] = int_field(state["active_ms"])
+    response = api.request("PATCH", f"/api/local-runs/{state['run_id']}", body)
     state["last_heartbeat_at"] = now
     state["last_server_run_status"] = response.get("status") if isinstance(response, dict) else None
     if isinstance(response, dict) and response.get("status") == "running":
@@ -425,7 +444,7 @@ def maybe_pause_idle_run(api: Api, state: dict) -> bool:
     )
     if last_activity <= 0 or now - last_activity < LOCAL_RUN_IDLE_TIMEOUT_SECONDS:
         return False
-    complete_local_run(api, state["run_id"])
+    complete_local_run(api, state["run_id"], active_ms=state.get("active_ms"))
     state["last_server_run_status"] = "completed"
     state["run_paused_at"] = now
     state["run_pause_reason"] = f"idle-timeout-{LOCAL_RUN_IDLE_TIMEOUT_SECONDS}s"
@@ -561,7 +580,11 @@ def watcher(state_path: Path) -> int:
                     return 0
                 if not plugin_installation_available(current):
                     try:
-                        complete_local_run(api, str(state.get("run_id") or ""))
+                        complete_local_run(
+                            api,
+                            str(state.get("run_id") or ""),
+                            active_ms=state.get("active_ms"),
+                        )
                         state["last_server_run_status"] = "completed"
                     except Exception as error:  # noqa: BLE001 - watcher cleanup must not crash
                         state["server_stop_error"] = str(error)
@@ -612,6 +635,8 @@ def watcher(state_path: Path) -> int:
                     current = read_json(state_path, {})
                     if current.get("status") != "running":
                         return 0
+                    if state.get("last_server_run_status") == "running":
+                        note_active_event(state, entry_epoch_seconds(entry))
                     if current.get("pid"):
                         state["pid"] = current["pid"]
                     state["offset"] = position

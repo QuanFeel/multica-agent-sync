@@ -30,6 +30,7 @@ from .core import (
     ApiError,
     active_states,
     atomic_json,
+    complete_local_run,
     config_source,
     create_local_run,
     detected_config_source,
@@ -39,7 +40,7 @@ from .core import (
     pid_alive,
     process_identity,
     read_json,
-    reset_current_run_usage,
+    reset_local_run_counters,
     secure_mkdir,
     select_states,
     session_lock,
@@ -116,7 +117,7 @@ def _start_tracking_locked(issue_key: str, path: Path, meta: dict) -> dict:
         "plugin_root": str(PLUGIN_ROOT),
         "plugin_version": plugin_version(),
     }
-    reset_current_run_usage(state, run_id)
+    reset_local_run_counters(state, run_id)
     state["usage_totals"] = latest_usage_total_before_offset(path, int(state["offset"]))
     state["usage_baseline_offset"] = state["offset"]
     state["usage_baseline_at"] = time.time()
@@ -175,12 +176,7 @@ def stop_one(state_path: Path, state: dict) -> str | None:
 
     server_error = None
     try:
-        api = Api()
-        api.request(
-            "PATCH",
-            f"/api/local-runs/{state['run_id']}",
-            {"status": "completed", "exit_code": 0, "error": ""},
-        )
+        complete_local_run(Api(), state["run_id"], active_ms=state.get("active_ms"))
     except ApiError as error:
         if error.status in {404, 410}:
             state["last_server_run_status"] = "missing"

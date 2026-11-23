@@ -1267,6 +1267,23 @@ class PluginLifecycleTests(unittest.TestCase):
             self.assertEqual(saved["last_server_run_status"], "missing")
             self.assertNotIn("server_stop_error", saved)
 
+    def test_manual_stop_sends_the_latest_saved_active_duration(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            for active_ms in (29_000, 0, None):
+                with self.subTest(active_ms=active_ms):
+                    state = {"status": "running", "run_id": "run-1", "issue": "OPE-1"}
+                    expected = {"status": "completed", "exit_code": 0, "error": ""}
+                    if active_ms is not None:
+                        state["active_ms"] = active_ms
+                        expected["active_ms"] = active_ms
+                    core.atomic_json(state_path, state)
+                    api = mock.Mock()
+                    with mock.patch.object(cli, "Api", return_value=api):
+                        self.assertIsNone(cli.stop_one(state_path, core.read_json(state_path)))
+                    api.request.assert_called_once_with("PATCH", "/api/local-runs/run-1", expected)
+                    self.assertEqual(core.read_json(state_path)["status"], "stopped")
+
 
 class ForkFollowTests(unittest.TestCase):
     """Regression coverage for Codex Desktop resume/compact fork following."""
@@ -1475,6 +1492,7 @@ class ForkFollowTests(unittest.TestCase):
             before_bind = self._message("2026-11-10T08:10:00.000Z", "before binding ✓")
             uploaded = self._message("2026-11-10T08:20:00.000Z", "already uploaded")
             new_message = self._message("2026-11-10T09:00:00.000Z", "new continuation")
+            new_usage = {**self._usage(130), "timestamp": "2026-11-10T09:00:10.000Z"}
             history = (before_bind, self._usage(80), uploaded, self._usage(20, "last_token_usage"), self._usage(100))
             parent = self._write_rollout(
                 root / "sessions/rollout-parent.jsonl", self.SESSION_ID, mtime=1000.0, entries=history,
@@ -1484,7 +1502,7 @@ class ForkFollowTests(unittest.TestCase):
                 root / "sessions/rollout-fork.jsonl",
                 self.SESSION_ID,
                 mtime=2000.0,
-                entries=(inherited_header, *history, new_message, self._usage(130)),
+                entries=(inherited_header, *history, new_message, new_usage),
                 header_timestamp="2026-11-10T09:00:00.000Z",
             )
             state_path = root / "state.json"
@@ -1499,6 +1517,8 @@ class ForkFollowTests(unittest.TestCase):
                 "short_lived_runs": False,
                 "last_server_run_status": "completed",
                 "run_paused_at": 1,
+                "active_ms": 60_000,
+                "active_span_last": codex_adapter.entry_epoch_seconds(uploaded),
                 "usage_totals": codex_adapter.normalized_usage_total({"input_tokens": 100}),
             })
             api = mock.Mock()
@@ -1508,6 +1528,7 @@ class ForkFollowTests(unittest.TestCase):
                 saved = codex_adapter.read_json(state_path)
                 self.assertEqual(saved["session_file"], str(fork))
                 self.assertEqual(saved["offset"], fork.stat().st_size)
+                self.assertEqual(saved["active_ms"], 10_000)
                 saved["status"] = "stopped"
                 codex_adapter.atomic_json(state_path, saved)
 
@@ -1528,6 +1549,110 @@ class ForkFollowTests(unittest.TestCase):
             self.assertEqual([(path, body["usage"][0]["input_tokens"]) for _, path, body in usage], [
                 ("/api/local-runs/run-2/usage", 30),
             ])
+
+
+class ActiveSpanTests(unittest.TestCase):
+    """Estimated activity across rollout events and server runs."""
+
+    def test_events_bridge_within_gap_and_split_across_it(self) -> None:
+        state: dict = {}
+        base = 1_000.0
+        core.note_active_event(state, base)
+        core.note_active_event(state, base + 10)
+        core.note_active_event(state, base + 15)  # 5s tool gap bridges
+        core.note_active_event(state, base + 25)
+        self.assertEqual(state["active_ms"], 25_000)
+
+        resume = base + 25 + core.LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS
+        core.note_active_event(state, resume)
+        core.note_active_event(state, resume + 21)
+        # The 5-minute idle gap is not billed; only the trailing span counts.
+        self.assertEqual(state["active_ms"], 25_000 + 21_000)
+
+    def test_out_of_order_and_invalid_events_are_ignored(self) -> None:
+        state: dict = {}
+        for timestamp in (1000, 1010, 1005, float("nan"), 0, None, 1010, 1020):
+            core.note_active_event(state, timestamp)
+        self.assertEqual(state["active_ms"], 20_000)
+        self.assertEqual(state["active_span_last"], 1020)
+
+    def test_upload_rotation_resets_active_duration(self) -> None:
+        for paused in (True, False):
+            with self.subTest(paused=paused):
+                state = {
+                    "issue_id": "fixture-issue",
+                    "run_id": "run-1",
+                    "last_server_run_status": "completed" if paused else "running",
+                    "active_ms": 60_000,
+                    "active_span_last": 1060,
+                }
+                if paused:
+                    state["run_paused_at"] = 1
+                api = mock.Mock()
+                api.request.return_value = {"id": "run-2"}
+                upload = mock.Mock()
+                if not paused:
+                    upload.side_effect = [
+                        core.ApiError("POST", "/api/local-runs/run-1/messages", "gone", 410),
+                        None,
+                    ]
+
+                core.with_upload_run(api, state, upload)
+
+                self.assertEqual(state["run_id"], "run-2")
+                self.assertEqual(state["active_ms"], 0)
+                self.assertEqual(state["active_span_last"], 0)
+                api.request.assert_any_call("PATCH", "/api/local-runs/run-2", {"status": "running", "active_ms": 0})
+                expected_uploads = [mock.call("run-2")] if paused else [mock.call("run-1"), mock.call("run-2")]
+                self.assertEqual(upload.call_args_list, expected_uploads)
+
+    def test_heartbeat_rotation_flushes_old_duration_and_starts_at_zero(self) -> None:
+        state = {
+            "issue_id": "fixture-issue",
+            "run_id": "run-1",
+            "run_mode": "session",
+            "short_lived_runs": False,
+            "active_ms": 60_000,
+            "active_span_last": 1060,
+        }
+        api = mock.Mock()
+        api.request.side_effect = [{"status": "completed"}, {"id": "run-2"}, {"status": "running"}]
+
+        self.assertTrue(codex_adapter.refresh_local_run(api, state, force=True))
+
+        self.assertEqual(state["run_id"], "run-2")
+        self.assertEqual(state["active_ms"], 0)
+        self.assertEqual(state["active_span_last"], 0)
+        api.request.assert_any_call("PATCH", "/api/local-runs/run-1", {"status": "running", "active_ms": 60_000})
+        api.request.assert_any_call("PATCH", "/api/local-runs/run-2", {"status": "running", "active_ms": 0})
+
+    def test_idle_completion_sends_active_duration(self) -> None:
+        state = {
+            "run_id": "run-1",
+            "last_server_run_status": "running",
+            "last_event_at": 1000,
+            "active_ms": 29_000,
+        }
+        api = mock.Mock()
+        with (
+            mock.patch.object(codex_adapter, "LOCAL_RUN_IDLE_TIMEOUT_SECONDS", 1800),
+            mock.patch.object(codex_adapter.time, "time", return_value=3000),
+        ):
+            self.assertTrue(codex_adapter.maybe_pause_idle_run(api, state))
+        api.request.assert_called_once_with(
+            "PATCH", "/api/local-runs/run-1",
+            {"status": "completed", "exit_code": 0, "error": "", "active_ms": 29_000},
+        )
+
+    def test_entry_epoch_handles_z_and_garbage(self) -> None:
+        self.assertAlmostEqual(
+            codex_adapter.entry_epoch_seconds({"timestamp": "2026-10-12T03:42:12.910Z"}),
+            1_791_776_532.91,
+            places=2,
+        )
+        self.assertEqual(codex_adapter.entry_epoch_seconds({}), 0.0)
+        self.assertEqual(codex_adapter.entry_epoch_seconds({"timestamp": "not-a-date"}), 0.0)
+        self.assertEqual(codex_adapter.entry_epoch_seconds({"timestamp": "2026-10-12T03:42:12"}), 0.0)
 
 
 if __name__ == "__main__":
