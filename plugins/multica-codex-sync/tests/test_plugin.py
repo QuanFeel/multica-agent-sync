@@ -10,6 +10,7 @@ import threading
 import unittest
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib import import_module
 from pathlib import Path
 from unittest import mock
 
@@ -20,8 +21,10 @@ HOOK = SCRIPTS / "prompt_submit.py"
 CLI_ENTRYPOINT = SCRIPTS / "multica_codex_track.py"
 sys.path.insert(0, str(SCRIPTS))
 
-import prompt_submit  # noqa: E402
-from multica_codex_sync import cli, codex_adapter, core  # noqa: E402
+prompt_submit = import_module("prompt_submit")
+cli = import_module("multica_codex_sync.cli")
+codex_adapter = import_module("multica_codex_sync.codex_adapter")
+core = import_module("multica_codex_sync.core")
 
 
 @contextmanager
