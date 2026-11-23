@@ -43,41 +43,26 @@ USAGE_TOTAL_KEYS = {
 }
 LOCAL_RUN_HEARTBEAT_INTERVAL_SECONDS = 30
 LOCAL_RUN_IDLE_TIMEOUT_SECONDS = int(os.environ.get("MULTICA_CODEX_IDLE_TIMEOUT_SECONDS", "1800"))
-# Model-activity events closer than this are one stretch of agent work (tool
-# runs between two model events); longer gaps are idle or human time.
+# Gaps of this length or longer are excluded from estimated activity.
 LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS = 300
 PLUGIN_DATA_MARKER = TRACK_HOME / ".multica-codex-sync-owned"
 PLUGIN_DATA_MARKER_CONTENT = "multica-codex-sync-plugin-data-v2\n"
 
 def note_active_event(state: dict, event_epoch: float) -> None:
-    """Fold one model-activity event into the run's active_ms.
-
-    Events closer than LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS bridge into one
-    stretch of agent work; longer gaps are idle or human time. The server's
-    dashboard prefers active_ms over wall clock for run duration, so keeping
-    this honest is what makes duration meaningful for long-lived sessions:
-    idle time never accumulates, and a watcher restart simply resumes from
-    the persisted ``active_span_last`` marker.
-    """
+    """Accumulate short gaps between increasing event timestamps."""
     try:
         moment = float(event_epoch)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return
     if not math.isfinite(moment) or moment <= 0:
-        # NaN would poison every later comparison and silently freeze the
-        # ledger, so non-finite stamps are dropped the same way as garbage.
+        return
+    last = float(state.get("active_span_last") or 0)
+    if moment <= last:
         return
     state.setdefault("active_ms", 0)
-    last = float(state.get("active_span_last") or 0)
-    if 0 < last and 0 < moment - last < LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS:
-        state["active_ms"] = int(state.get("active_ms") or 0) + int((moment - last) * 1000)
+    if 0 < last and moment - last < LOCAL_RUN_ACTIVE_SPAN_GAP_SECONDS:
+        state["active_ms"] += round((moment - last) * 1000)
     state["active_span_last"] = moment
-
-
-def reset_active_span(state: dict) -> None:
-    """Start a fresh active-time ledger for a replacement run."""
-    state["active_ms"] = 0
-    state["active_span_last"] = 0.0
 
 
 def secure_mkdir(path: Path) -> None:
@@ -541,9 +526,11 @@ def int_field(value) -> int:
         return 0
 
 
-def reset_current_run_usage(state: dict, run_id: str | None = None) -> None:
-    state["usage_current_run_id"] = str(run_id or state.get("run_id") or "")
+def reset_local_run_counters(state: dict, run_id: str) -> None:
+    state["usage_current_run_id"] = str(run_id)
     state["usage_current_run_totals"] = {key: 0 for key in USAGE_TOTAL_KEYS}
+    state["active_ms"] = 0
+    state["active_span_last"] = 0.0
 
 
 def create_local_run(api: Api, issue_id: str, meta: dict) -> str:
@@ -564,15 +551,14 @@ def create_local_run(api: Api, issue_id: str, meta: dict) -> str:
     run_id = created.get("id") or created.get("run", {}).get("id")
     if not run_id:
         raise RuntimeError(f"Multica did not return a local run id: {created}")
-    api.request("PATCH", f"/api/local-runs/{run_id}", {"status": "running"})
+    api.request("PATCH", f"/api/local-runs/{run_id}", {"status": "running", "active_ms": 0})
     return run_id
 
 
-def complete_local_run(api: Api, run_id: str, active_ms: int = 0) -> None:
+def complete_local_run(api: Api, run_id: str, active_ms: int | None = None) -> None:
     body = {"status": "completed", "exit_code": 0, "error": ""}
-    active = int(active_ms or 0)
-    if active > 0:
-        body["active_ms"] = active
+    if active_ms is not None:
+        body["active_ms"] = int_field(active_ms)
     api.request("PATCH", f"/api/local-runs/{run_id}", body)
 
 
@@ -602,7 +588,7 @@ def with_upload_run(api: Api, state: dict, upload) -> None:
         run_id = create_local_run(api, state["issue_id"], upload_run_meta(state))
         state["run_id"] = run_id
         state["last_upload_run_id"] = run_id
-        reset_current_run_usage(state, str(run_id))
+        reset_local_run_counters(state, run_id)
         state["last_server_run_status"] = "running"
         state["short_lived_runs"] = False
         state["run_mode"] = "session"
@@ -624,7 +610,7 @@ def with_upload_run(api: Api, state: dict, upload) -> None:
         run_id = create_local_run(api, state["issue_id"], upload_run_meta(state))
         state["run_id"] = run_id
         state["last_upload_run_id"] = run_id
-        reset_current_run_usage(state, str(run_id))
+        reset_local_run_counters(state, run_id)
         state["last_server_run_status"] = "running"
         state["short_lived_runs"] = False
         state["run_mode"] = "session"

@@ -13,6 +13,10 @@ conversation messages and token usage to the issue's local run.
 If Codex Desktop resumes that task in a new rollout file, the watcher
 continues from the saved position after verifying the copied history.
 
+The watcher estimates each run's active duration from gaps of less than five
+minutes between rollout events. This estimate can include short pauses and
+omit a long tool call with no intervening events.
+
 The repository currently ships **Codex support only**. Its runtime separates the
 Codex adapter from the Multica transport so other agent hosts can be considered
 later, but no Claude integration is included or claimed in this release.
